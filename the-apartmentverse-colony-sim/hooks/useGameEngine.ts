@@ -4,6 +4,15 @@ import { GameState, Agent, ZoneType, AgentType, Point, LogEntry, Artifact, Artif
 import { GRID_W, GRID_H, QUOTES, COLORS, L_THRESHOLD, ARTIFACT_DEFINITIONS, CHARACTER_EMOJIS, ZONE_CONFIG, AGENT_REST_ZONES, CHEF_TARGET_SPACES, NARRATIVE_ARTIFACT_TYPES, PERFORMANCE_VENUES, RESTLESS_CYCLE_TICKS, CHEF_CIRCUIT, HOME_CYCLE_INTERVAL, HOME_CYCLE_DURATION, STORE_SECTIONS, HOLO_CIRCUIT, BALANCE, ZONE_TO_SPACE_MAP, SPACE_TO_ZONE_MAP } from '../constants';
 import { ActivitySystem } from '../activities';
 import { CharacterActivityLogic } from '../character-activities';
+import {
+    clampAgentNeeds,
+    validateAgentPosition,
+    detectAndRecoverStuckAgent,
+    resetStuckDetection,
+    validateArtifactCreation,
+    isValidCoordinate,
+    clamp
+} from '../utils/validation';
 
 // --- HELPER FUNCTIONS ---
 const getTile = (map: number[], x: number, y: number): number => {
@@ -313,7 +322,28 @@ export const useGameEngine = () => {
 
     const updateAgent = (agent: Agent, state: GameState, tick: number) => {
         const map = state.map;
-        
+
+        // =================================================================
+        // DEFENSIVE CHECKS (First line of defense against bad state)
+        // =================================================================
+
+        // 1. Validate position - if agent is out of bounds, correct it
+        // WHY: Pathfinding bugs or teleport errors could put agents outside map
+        validateAgentPosition(agent);
+
+        // 2. Detect and recover stuck agents
+        // WHY: Complex AI logic can sometimes leave agents unable to move
+        detectAndRecoverStuckAgent(agent, tick, log);
+
+        // 3. Ensure efficiency/speed are valid (prevent division by zero)
+        // WHY: Bad initialization or state corruption could cause NaN values
+        if (agent.efficiency <= 0) agent.efficiency = 1;
+        if (agent.speed <= 0) agent.speed = 2;
+
+        // =================================================================
+        // SPATIAL AWARENESS UPDATE
+        // =================================================================
+
         // Update spatial awareness
         agent.currentSpace = getSpaceIdFromCoordinates(agent.x, agent.y, map);
         // Track visit history
@@ -324,9 +354,20 @@ export const useGameEngine = () => {
             agent.motivations = agent.motivations.filter(m => !m.expiresAt || m.expiresAt > tick);
         }
 
-        // 1. Base Decay
-        agent.needs.energy -= (BALANCE.BASE_ENERGY_DECAY / agent.efficiency);
-        agent.needs.stability -= BALANCE.STABILITY_DECAY;
+        // =================================================================
+        // NEEDS DECAY (with safe clamping)
+        // WHY: Using clamp() prevents energy from going negative
+        // =================================================================
+
+        // 1. Base Decay - energy drains based on efficiency
+        agent.needs.energy = clamp(
+            agent.needs.energy - (BALANCE.BASE_ENERGY_DECAY / agent.efficiency),
+            0, 100
+        );
+        agent.needs.stability = clamp(
+            agent.needs.stability - BALANCE.STABILITY_DECAY,
+            0, 100
+        );
         
         // 2. Passive Regeneration (if not creating)
         const isCreating = Object.values(state.creationTasks).some(t => t.creators.includes(agent.id));
@@ -1582,50 +1623,82 @@ export const useGameEngine = () => {
         s.ticks++;
         const currentTick = s.ticks;
 
-        // --- RHYTHMIC HOME INJECTION ---
-        // Every 400 ticks, for 20 ticks, inject 'return_home'
-        const isHomeTime = (currentTick % HOME_CYCLE_INTERVAL) < HOME_CYCLE_DURATION;
-        if (isHomeTime) {
-            s.agents.forEach(a => {
-                if (!a.motivations.some(m => m.type === 'return_home')) {
-                    a.motivations.push({
-                        type: 'return_home',
-                        intensity: 0.8,
-                        description: 'Returning to personal space',
-                        expiresAt: currentTick + HOME_CYCLE_DURATION + 20 // Buffer
-                    });
-                    // Optional: Log once per cycle per agent
-                    // log('RHYTHM', a.name, 'Returning home...');
+        // =================================================================
+        // TICK WRAPPER WITH ERROR RECOVERY
+        // WHY: One agent's error shouldn't crash the entire simulation.
+        // We log errors but continue processing other agents.
+        // =================================================================
+
+        try {
+            // --- RHYTHMIC HOME INJECTION ---
+            // Every 400 ticks, for 20 ticks, inject 'return_home'
+            const isHomeTime = (currentTick % HOME_CYCLE_INTERVAL) < HOME_CYCLE_DURATION;
+            if (isHomeTime) {
+                s.agents.forEach(a => {
+                    if (!a.motivations.some(m => m.type === 'return_home')) {
+                        a.motivations.push({
+                            type: 'return_home',
+                            intensity: 0.8,
+                            description: 'Returning to personal space',
+                            expiresAt: currentTick + HOME_CYCLE_DURATION + 20 // Buffer
+                        });
+                    }
+                });
+            }
+
+            // L-System Timer
+            s.l_timer++;
+            let glitch = false;
+            if (s.l_timer >= L_THRESHOLD) {
+                s.l_timer = 0;
+                initMap();
+                glitch = true;
+                // Reset stuck detection when map changes
+                // WHY: Map regeneration invalidates position history
+                resetStuckDetection();
+                const quote = QUOTES['L'][Math.floor(Math.random() * QUOTES['L'].length)];
+                log('L', 'SYSTEM', quote);
+            }
+
+            // =================================================================
+            // UPDATE AGENTS (with individual error isolation)
+            // WHY: If one agent's AI throws, others continue working
+            // =================================================================
+            s.agents.forEach(agent => {
+                try {
+                    updateAgent(agent, s, currentTick);
+                } catch (agentError) {
+                    // Log but don't crash - this agent will skip this tick
+                    console.error(`Error updating agent ${agent.name}:`, agentError);
+                    // Reset agent to safe state
+                    agent.path = [];
+                    agent.target = null;
+                    agent.currentAction = "Recovering...";
                 }
+
+                // =================================================================
+                // FINAL SAFETY NET: Clamp all needs after all operations
+                // WHY: Even if some code forgot to clamp, we ensure valid state
+                // This is called AFTER updateAgent to catch any edge cases
+                // =================================================================
+                clampAgentNeeds(agent);
             });
+
+            // Activity System (Progress & Decisions)
+            // This handles completion effects (like organization) and starts new activities
+            processActivitySystemLogic(s, currentTick);
+
+            // Process Event System (Gathering, Performance)
+            processEventSystem(s, currentTick);
+
+            // Artifact System (Creation & Consumption)
+            // This handles Chef meals, comics, sketches, and eating/reading
+            processArtifactSystem(s, currentTick);
+        } catch (tickError) {
+            // Catastrophic tick error - log but try to continue
+            console.error(`Tick ${currentTick} failed:`, tickError);
+            // The simulation will continue on the next tick
         }
-
-        // L-System Timer
-        s.l_timer++;
-        let glitch = false;
-        if (s.l_timer >= L_THRESHOLD) {
-            s.l_timer = 0;
-            initMap();
-            glitch = true;
-            const quote = QUOTES['L'][Math.floor(Math.random() * QUOTES['L'].length)];
-            log('L', 'SYSTEM', quote);
-        }
-
-        // Update Agents (Movement, Needs, AI)
-        s.agents.forEach(agent => {
-            updateAgent(agent, s, currentTick);
-        });
-
-        // Activity System (Progress & Decisions)
-        // This handles completion effects (like organization) and starts new activities
-        processActivitySystemLogic(s, currentTick);
-
-        // Process Event System (Gathering, Performance)
-        processEventSystem(s, currentTick);
-
-        // Artifact System (Creation & Consumption)
-        // This handles Chef meals, comics, sketches, and eating/reading
-        processArtifactSystem(s, currentTick);
 
         // TETHER PASSIVE CARE EFFECT
         const carl = s.agents.find(a => a.type === AgentType.CARL);

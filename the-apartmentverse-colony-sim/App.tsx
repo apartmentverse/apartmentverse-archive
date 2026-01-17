@@ -7,6 +7,7 @@ import TerminalOverlay from './components/TerminalOverlay';
 import TitleScreen from './components/TitleScreen';
 import SummaryScreen from './components/SummaryScreen';
 import EventPopup from './components/EventPopup';
+import { SimulationErrorBoundary, ErrorBoundary } from './components/ErrorBoundary';
 import { TICK_RATE, L_THRESHOLD, GRID_W, GRID_H, ZONE_CONFIG } from './constants';
 import { CameraState, ZoneType } from './types';
 
@@ -124,56 +125,70 @@ const App: React.FC = () => {
         setIsPaused(false); // RESUME WITHOUT FOCUS
     };
 
+    // =========================================================================
+    // RENDER WITH ERROR BOUNDARIES
+    // WHY: Wrapping with error boundaries prevents crashes from cascading.
+    // - SimulationErrorBoundary: Catches errors in the entire simulation
+    // - Individual ErrorBoundary: Catches errors in specific components
+    // =========================================================================
     return (
-        <div className="flex h-screen w-screen bg-black overflow-hidden relative font-inter">
-            {simulationState === 'title' ? (
-                <TitleScreen onStart={handleStart} />
-            ) : simulationState === 'complete' ? (
-                <SummaryScreen gameState={stateRef.current} onRestart={handleRestart} />
-            ) : (
-                <>
-                    {/* Game View */}
-                    <GameCanvas 
-                        gameStateRef={stateRef}
-                        camera={camera}
-                        setCamera={setCamera}
-                        onSelectAgent={handleSelectAgent}
-                        glitch={glitchEffect}
-                    />
+        <SimulationErrorBoundary>
+            <div className="flex h-screen w-screen bg-black overflow-hidden relative font-inter">
+                {simulationState === 'title' ? (
+                    <TitleScreen onStart={handleStart} />
+                ) : simulationState === 'complete' ? (
+                    <SummaryScreen gameState={stateRef.current} onRestart={handleRestart} />
+                ) : (
+                    <>
+                        {/* Game View - wrapped for isolation */}
+                        <ErrorBoundary componentName="GameCanvas">
+                            <GameCanvas
+                                gameStateRef={stateRef}
+                                camera={camera}
+                                setCamera={setCamera}
+                                onSelectAgent={handleSelectAgent}
+                                glitch={glitchEffect}
+                            />
+                        </ErrorBoundary>
 
-                    {/* Terminal Overlay (Absolute positioning over canvas) */}
-                    <TerminalOverlay 
-                        stats={stateRef.current.stats} 
-                        agents={stateRef.current.agents}
-                        width={GRID_W}
-                        height={GRID_H}
-                        show={terminalOpen}
-                    />
-                    
-                    {/* Event Popup */}
-                    <EventPopup 
-                        event={stateRef.current.currentEvent}
-                        artifacts={stateRef.current.artifacts}
-                        agents={stateRef.current.agents}
-                        onClose={handleEventClose}
-                        onFocus={handleEventFocus}
-                    />
+                        {/* Terminal Overlay (Absolute positioning over canvas) */}
+                        <ErrorBoundary componentName="TerminalOverlay">
+                            <TerminalOverlay
+                                stats={stateRef.current.stats}
+                                agents={stateRef.current.agents}
+                                width={GRID_W}
+                                height={GRID_H}
+                                show={terminalOpen}
+                            />
+                        </ErrorBoundary>
 
-                    {/* Sidebar UI */}
-                    <Sidebar 
-                        agents={stateRef.current.agents}
-                        selectedAgentId={selectedAgentId}
-                        onSelectAgent={handleSelectAgent}
-                        logs={stateRef.current.logs}
-                        lTimer={stateRef.current.l_timer}
-                        lThreshold={L_THRESHOLD}
-                        tick={uiTick}
-                        toggleTerminal={() => setTerminalOpen(!terminalOpen)}
-                        terminalOpen={terminalOpen}
-                    />
-                </>
-            )}
-        </div>
+                        {/* Event Popup */}
+                        <EventPopup
+                            event={stateRef.current.currentEvent}
+                            artifacts={stateRef.current.artifacts}
+                            agents={stateRef.current.agents}
+                            onClose={handleEventClose}
+                            onFocus={handleEventFocus}
+                        />
+
+                        {/* Sidebar UI */}
+                        <ErrorBoundary componentName="Sidebar">
+                            <Sidebar
+                                agents={stateRef.current.agents}
+                                selectedAgentId={selectedAgentId}
+                                onSelectAgent={handleSelectAgent}
+                                logs={stateRef.current.logs}
+                                lTimer={stateRef.current.l_timer}
+                                lThreshold={L_THRESHOLD}
+                                tick={uiTick}
+                                toggleTerminal={() => setTerminalOpen(!terminalOpen)}
+                                terminalOpen={terminalOpen}
+                            />
+                        </ErrorBoundary>
+                    </>
+                )}
+            </div>
+        </SimulationErrorBoundary>
     );
 };
 
