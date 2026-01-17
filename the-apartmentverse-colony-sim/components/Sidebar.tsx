@@ -16,7 +16,14 @@ interface SidebarProps {
     terminalOpen: boolean;
 }
 
-const StatBar = ({ label, value, color, icon: Icon }: any) => (
+interface StatBarProps {
+    label: string;
+    value: number;
+    color: string;
+    icon?: React.ComponentType<{ size?: number }>;
+}
+
+const StatBar: React.FC<StatBarProps> = ({ label, value, color, icon: Icon }) => (
     <div className="mb-2">
         <div className="flex justify-between text-[10px] uppercase tracking-wider text-gray-400 mb-1">
             <span className="flex items-center gap-1">{Icon && <Icon size={10} />} {label}</span>

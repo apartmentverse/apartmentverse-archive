@@ -32,7 +32,13 @@ const AnimatedNumber = ({ value, duration = 1000 }: { value: number, duration?: 
     return <span>{displayValue}</span>;
 };
 
-const SectionHeader = ({ icon: Icon, title, color = "purple" }: any) => (
+interface SectionHeaderProps {
+    icon: React.ComponentType<{ size?: number }>;
+    title: string;
+    color?: string;
+}
+
+const SectionHeader: React.FC<SectionHeaderProps> = ({ icon: Icon, title, color = "purple" }) => (
     <h3 className={`text-sm font-bold text-${color}-400 uppercase tracking-widest mb-4 flex items-center gap-2 border-b border-${color}-500/30 pb-2`}>
         <Icon size={14} />
         {title}

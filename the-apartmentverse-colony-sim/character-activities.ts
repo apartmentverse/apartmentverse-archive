@@ -1,7 +1,7 @@
 
 import { Character, CharacterId, AgentType, Artifact, ActivityDecision } from './types';
 import { ActivitySystem, ActivityDefinitions } from './activities';
-import { AGENT_REST_ZONES, PERFORMANCE_VENUES } from './constants';
+import { AGENT_REST_ZONES, PERFORMANCE_VENUES, BALANCE } from './constants';
 
 export class CharacterActivityLogic {
   /**
@@ -41,9 +41,9 @@ export class CharacterActivityLogic {
     }
 
     // Need minimum energy
-    const minEnergy = character.id.startsWith('sage') ? 10 : 15;
-    if (character.needs.energy < minEnergy) { 
-      return null; 
+    const minEnergy = character.id.startsWith('sage') ? BALANCE.MIN_ENERGY_FOR_ACTIVITY_SAGE : BALANCE.MIN_ENERGY_FOR_ACTIVITY_OTHER;
+    if (character.needs.energy < minEnergy) {
+      return null;
     }
 
     // L doesn't perform activities
