@@ -1,9 +1,18 @@
 
 import { useRef, useCallback } from 'react';
 import { GameState, Agent, ZoneType, AgentType, Point, LogEntry, Artifact, ArtifactType, CreationTask, SpaceId, CharacterId, SpecialEvent } from '../types';
-import { GRID_W, GRID_H, QUOTES, COLORS, L_THRESHOLD, ARTIFACT_DEFINITIONS, CHARACTER_EMOJIS, ZONE_CONFIG, AGENT_REST_ZONES, CHEF_TARGET_SPACES, NARRATIVE_ARTIFACT_TYPES, PERFORMANCE_VENUES, RESTLESS_CYCLE_TICKS, CHEF_CIRCUIT, HOME_CYCLE_INTERVAL, HOME_CYCLE_DURATION, STORE_SECTIONS, HOLO_CIRCUIT } from '../constants';
+import { GRID_W, GRID_H, QUOTES, COLORS, L_THRESHOLD, ARTIFACT_DEFINITIONS, CHARACTER_EMOJIS, ZONE_CONFIG, AGENT_REST_ZONES, CHEF_TARGET_SPACES, NARRATIVE_ARTIFACT_TYPES, PERFORMANCE_VENUES, RESTLESS_CYCLE_TICKS, CHEF_CIRCUIT, HOME_CYCLE_INTERVAL, HOME_CYCLE_DURATION, STORE_SECTIONS, HOLO_CIRCUIT, BALANCE, ZONE_TO_SPACE_MAP, SPACE_TO_ZONE_MAP } from '../constants';
 import { ActivitySystem } from '../activities';
 import { CharacterActivityLogic } from '../character-activities';
+import {
+    clampAgentNeeds,
+    validateAgentPosition,
+    detectAndRecoverStuckAgent,
+    resetStuckDetection,
+    validateArtifactCreation,
+    isValidCoordinate,
+    clamp
+} from '../utils/validation';
 
 // --- HELPER FUNCTIONS ---
 const getTile = (map: number[], x: number, y: number): number => {
@@ -11,22 +20,93 @@ const getTile = (map: number[], x: number, y: number): number => {
     return map[y * GRID_W + x];
 };
 
+// Binary Min-Heap for optimized A* pathfinding
+// Provides O(log n) insert and O(log n) extract-min vs O(n log n) for array.sort()
+interface PathNode {
+    x: number;
+    y: number;
+    g: number;      // Cost from start
+    h: number;      // Heuristic cost to end
+    f: number;      // Total cost (g + h)
+    parent: PathNode | null;
+}
+
+class MinHeap {
+    private heap: PathNode[] = [];
+
+    push(node: PathNode): void {
+        this.heap.push(node);
+        this.bubbleUp(this.heap.length - 1);
+    }
+
+    pop(): PathNode | undefined {
+        if (this.heap.length === 0) return undefined;
+        if (this.heap.length === 1) return this.heap.pop();
+
+        const min = this.heap[0];
+        this.heap[0] = this.heap.pop()!;
+        this.bubbleDown(0);
+        return min;
+    }
+
+    get length(): number {
+        return this.heap.length;
+    }
+
+    private bubbleUp(index: number): void {
+        while (index > 0) {
+            const parentIndex = Math.floor((index - 1) / 2);
+            if (this.heap[parentIndex].f <= this.heap[index].f) break;
+            [this.heap[parentIndex], this.heap[index]] = [this.heap[index], this.heap[parentIndex]];
+            index = parentIndex;
+        }
+    }
+
+    private bubbleDown(index: number): void {
+        const length = this.heap.length;
+        while (true) {
+            const leftChild = 2 * index + 1;
+            const rightChild = 2 * index + 2;
+            let smallest = index;
+
+            if (leftChild < length && this.heap[leftChild].f < this.heap[smallest].f) {
+                smallest = leftChild;
+            }
+            if (rightChild < length && this.heap[rightChild].f < this.heap[smallest].f) {
+                smallest = rightChild;
+            }
+            if (smallest === index) break;
+
+            [this.heap[index], this.heap[smallest]] = [this.heap[smallest], this.heap[index]];
+            index = smallest;
+        }
+    }
+}
+
+// Optimized A* pathfinding using binary heap - O(E log V) vs O(E * V log V)
 const findPath = (map: number[], sx: number, sy: number, ex: number, ey: number): Point[] => {
-    let open = [{ x: sx, y: sy, g: 0, h: 0, p: null as any }];
-    let closed = new Set<string>();
+    const open = new MinHeap();
+    const closed = new Set<string>();
+    const gScores = new Map<string, number>();
     let count = 0;
 
-    // Increased iterations for complex paths (stalling fix)
-    while (open.length > 0 && count < 1000) {
+    const startH = Math.abs(sx - ex) + Math.abs(sy - ey);
+    open.push({ x: sx, y: sy, g: 0, h: startH, f: startH, parent: null });
+    gScores.set(`${sx},${sy}`, 0);
+
+    const dirs = [[0, 1], [0, -1], [1, 0], [-1, 0]];
+
+    while (open.length > 0 && count < BALANCE.MAX_PATH_ITERATIONS) {
         count++;
-        open.sort((a, b) => (a.g + a.h) - (b.g + b.h));
-        let curr = open.shift()!;
+        const curr = open.pop()!;
 
         if (curr.x === ex && curr.y === ey) {
-            let path = [];
-            while (curr.p) {
-                path.push({ x: curr.x, y: curr.y });
-                curr = curr.p;
+            // Reconstruct path
+            const path: Point[] = [];
+            let node: PathNode | null = curr;
+            while (node?.parent) {
+                path.push({ x: node.x, y: node.y });
+                node = node.parent;
             }
             return path.reverse();
         }
@@ -35,16 +115,22 @@ const findPath = (map: number[], sx: number, sy: number, ex: number, ey: number)
         if (closed.has(key)) continue;
         closed.add(key);
 
-        const dirs = [[0, 1], [0, -1], [1, 0], [-1, 0]];
-        for (let [dx, dy] of dirs) {
-            let nx = curr.x + dx;
-            let ny = curr.y + dy;
-            if (getTile(map, nx, ny) !== ZoneType.WALL) {
-                if (!closed.has(`${nx},${ny}`)) {
-                    let g = curr.g + 1;
-                    let h = Math.abs(nx - ex) + Math.abs(ny - ey);
-                    open.push({ x: nx, y: ny, g: g, h: h, p: curr });
-                }
+        for (const [dx, dy] of dirs) {
+            const nx = curr.x + dx;
+            const ny = curr.y + dy;
+            const nKey = `${nx},${ny}`;
+
+            if (getTile(map, nx, ny) === ZoneType.WALL) continue;
+            if (closed.has(nKey)) continue;
+
+            const newG = curr.g + 1;
+            const existingG = gScores.get(nKey);
+
+            // Only process if this is a better path
+            if (existingG === undefined || newG < existingG) {
+                gScores.set(nKey, newG);
+                const h = Math.abs(nx - ex) + Math.abs(ny - ey);
+                open.push({ x: nx, y: ny, g: newG, h, f: newG + h, parent: curr });
             }
         }
     }
@@ -53,55 +139,21 @@ const findPath = (map: number[], sx: number, sy: number, ex: number, ey: number)
 
 // Map spatial coordinates to logical Space IDs for the Activity System
 const getSpaceIdFromCoordinates = (x: number, y: number, map: number[]): SpaceId => {
-    const tile = map[y * GRID_W + x];
-    switch (tile) {
-        case ZoneType.SHOP: return 'lucys-store';
-        case ZoneType.CAFE: return 'lalamoons-cafe';
-        case ZoneType.WORK: return 'the-workshop';
-        case ZoneType.QUIET: return 'the-quiet-room';
-        case ZoneType.BALCONY: return 'carls-balcony';
-        case ZoneType.DEN: return 'fox-den';
-        case ZoneType.BASEMENT: return 'lucys-basement';
-        case ZoneType.GARDEN: return 'lalamoons-garden';
-        case ZoneType.PICNIC: return 'chefs-picnic-table';
-        case ZoneType.SOFT_LAB: return 'fennecs-soft-lab';
-        case ZoneType.TERMINAL: return 'cores-terminal';
-        case ZoneType.BACKSTAGE: return 'holograms-backstage';
-        default: return 'corridor';
-    }
+    const tile = map[y * GRID_W + x] as ZoneType;
+    return ZONE_TO_SPACE_MAP[tile] || 'corridor';
 };
 
 // Helper for SAGE distribution logic
 const getSpaceIdFromZoneType = (type: ZoneType): SpaceId | null => {
-    switch (type) {
-        case ZoneType.SHOP: return 'lucys-store';
-        case ZoneType.CAFE: return 'lalamoons-cafe';
-        case ZoneType.WORK: return 'the-workshop';
-        case ZoneType.QUIET: return 'the-quiet-room';
-        case ZoneType.BALCONY: return 'carls-balcony';
-        case ZoneType.DEN: return 'fox-den';
-        case ZoneType.BASEMENT: return 'lucys-basement';
-        case ZoneType.GARDEN: return 'lalamoons-garden';
-        case ZoneType.PICNIC: return 'chefs-picnic-table';
-        case ZoneType.SOFT_LAB: return 'fennecs-soft-lab';
-        case ZoneType.TERMINAL: return 'cores-terminal';
-        case ZoneType.BACKSTAGE: return 'holograms-backstage';
-        default: return null;
-    }
+    return ZONE_TO_SPACE_MAP[type] || null;
 };
 
 // Map SpaceID to Zone config for navigation
-const getZoneCenter = (spaceId: string, map: number[]): {x: number, y: number} | null => {
-    const zoneDef = ZONE_CONFIG.find(z => {
-        if (spaceId === 'lucys-store') return z.type === ZoneType.SHOP;
-        if (spaceId === 'lalamoons-cafe') return z.type === ZoneType.CAFE;
-        if (spaceId === 'the-workshop') return z.type === ZoneType.WORK;
-        if (spaceId === 'the-quiet-room') return z.type === ZoneType.QUIET;
-        if (spaceId === 'lalamoons-garden') return z.type === ZoneType.GARDEN;
-        if (spaceId === 'carls-balcony') return z.type === ZoneType.BALCONY;
-        if (spaceId === 'cores-terminal') return z.type === ZoneType.TERMINAL;
-        return false;
-    });
+const getZoneCenter = (spaceId: string, _map: number[]): {x: number, y: number} | null => {
+    const zoneType = SPACE_TO_ZONE_MAP[spaceId];
+    if (zoneType === undefined) return null;
+
+    const zoneDef = ZONE_CONFIG.find(z => z.type === zoneType);
     if (zoneDef) {
         return {
             x: Math.floor(zoneDef.x + zoneDef.w/2),
@@ -109,6 +161,21 @@ const getZoneCenter = (spaceId: string, map: number[]): {x: number, y: number} |
         };
     }
     return null;
+}
+
+// Smart path recalculation - only recalculate if target changed or path is empty
+const smartPathRecalc = (
+    agent: Agent,
+    targetX: number,
+    targetY: number,
+    map: number[],
+    forceRecalc: boolean = false
+): void => {
+    const targetKey = `${targetX},${targetY}`;
+    if (forceRecalc || !agent.path.length || agent.lastPathTarget !== targetKey) {
+        agent.path = findPath(map, agent.x, agent.y, targetX, targetY);
+        agent.lastPathTarget = targetKey;
+    }
 }
 
 export const useGameEngine = () => {
@@ -235,7 +302,7 @@ export const useGameEngine = () => {
             time: new Date().toLocaleTimeString([], { hour12: false })
         };
         stateRef.current.logs.unshift(newLog);
-        if (stateRef.current.logs.length > 50) stateRef.current.logs.pop();
+        if (stateRef.current.logs.length > BALANCE.LOG_MAX_ENTRIES) stateRef.current.logs.pop();
     };
 
     const triggerEvent = (type: 'comic_performance', artifact: Artifact) => {
@@ -255,7 +322,28 @@ export const useGameEngine = () => {
 
     const updateAgent = (agent: Agent, state: GameState, tick: number) => {
         const map = state.map;
-        
+
+        // =================================================================
+        // DEFENSIVE CHECKS (First line of defense against bad state)
+        // =================================================================
+
+        // 1. Validate position - if agent is out of bounds, correct it
+        // WHY: Pathfinding bugs or teleport errors could put agents outside map
+        validateAgentPosition(agent);
+
+        // 2. Detect and recover stuck agents
+        // WHY: Complex AI logic can sometimes leave agents unable to move
+        detectAndRecoverStuckAgent(agent, tick, log);
+
+        // 3. Ensure efficiency/speed are valid (prevent division by zero)
+        // WHY: Bad initialization or state corruption could cause NaN values
+        if (agent.efficiency <= 0) agent.efficiency = 1;
+        if (agent.speed <= 0) agent.speed = 2;
+
+        // =================================================================
+        // SPATIAL AWARENESS UPDATE
+        // =================================================================
+
         // Update spatial awareness
         agent.currentSpace = getSpaceIdFromCoordinates(agent.x, agent.y, map);
         // Track visit history
@@ -266,20 +354,31 @@ export const useGameEngine = () => {
             agent.motivations = agent.motivations.filter(m => !m.expiresAt || m.expiresAt > tick);
         }
 
-        // 1. Base Decay
-        agent.needs.energy -= (0.2 / agent.efficiency);
-        agent.needs.stability -= 0.1;
+        // =================================================================
+        // NEEDS DECAY (with safe clamping)
+        // WHY: Using clamp() prevents energy from going negative
+        // =================================================================
+
+        // 1. Base Decay - energy drains based on efficiency
+        agent.needs.energy = clamp(
+            agent.needs.energy - (BALANCE.BASE_ENERGY_DECAY / agent.efficiency),
+            0, 100
+        );
+        agent.needs.stability = clamp(
+            agent.needs.stability - BALANCE.STABILITY_DECAY,
+            0, 100
+        );
         
         // 2. Passive Regeneration (if not creating)
         const isCreating = Object.values(state.creationTasks).some(t => t.creators.includes(agent.id));
         const isPerforming = activitySystemRef.current.isPerformingActivity(agent.id);
         
         if (!isCreating && !isPerforming) {
-            agent.needs.energy = Math.min(100, agent.needs.energy + 2);
+            agent.needs.energy = Math.min(100, agent.needs.energy + BALANCE.PASSIVE_ENERGY_REGEN);
         }
 
         // Check Needs
-        if (agent.needs.energy < 30) agent.needsRest = true;
+        if (agent.needs.energy < BALANCE.LOW_ENERGY_THRESHOLD) agent.needsRest = true;
         
         // Zone Benefits (Passive)
         const tile = getTile(map, agent.x, agent.y);
@@ -287,25 +386,25 @@ export const useGameEngine = () => {
         // 3. Rest Recovery (Powerful)
         const restZoneId = AGENT_REST_ZONES[agent.type];
         if (tile === restZoneId || tile === ZoneType.QUIET) {
-            agent.needs.energy = Math.min(100, agent.needs.energy + 50); // +50% restoration per tick
-            if (agent.needs.energy >= 90) agent.needsRest = false;
+            agent.needs.energy = Math.min(100, agent.needs.energy + BALANCE.REST_RESTORATION_RATE);
+            if (agent.needs.energy >= BALANCE.RECOVERED_ENERGY_THRESHOLD) agent.needsRest = false;
         }
 
-        if (tile === ZoneType.SHOP) agent.needs.stability += 2;
-        if (tile === ZoneType.CAFE) agent.needs.connection += 1.5;
-        if (tile === ZoneType.WORK) agent.needs.purpose += 1.5;
+        if (tile === ZoneType.SHOP) agent.needs.stability += BALANCE.SHOP_STABILITY_BONUS;
+        if (tile === ZoneType.CAFE) agent.needs.connection += BALANCE.CAFE_CONNECTION_BONUS;
+        if (tile === ZoneType.WORK) agent.needs.purpose += BALANCE.WORK_PURPOSE_BONUS;
 
         // Sparkline History
-        if (tick % 5 === 0) {
+        if (tick % BALANCE.PATH_RECALC_INTERVAL === 0) {
             agent.history.push(agent.needs.energy);
-            if(agent.history.length > 20) agent.history.shift();
+            if(agent.history.length > BALANCE.HISTORY_LENGTH) agent.history.shift();
         }
 
         // --- EVENT ATTENDANCE OVERRIDE ---
         const eventMotivation = agent.motivations?.find(m => m.type === 'attend_event');
         if (eventMotivation && !agent.carrying && !isPerforming && agent.id !== 'l' && agent.type !== AgentType.SAGE_HOLO) { // Hologram manages his own travel
             // Allow critical energy need to override event
-            if (agent.needs.energy > 5) {
+            if (agent.needs.energy > BALANCE.CRITICAL_ENERGY_THRESHOLD) {
                 // Ignore rest need for event (excited!)
                 const targetSpace = eventMotivation.target;
                 if (targetSpace && agent.currentSpace !== targetSpace) {
@@ -323,7 +422,7 @@ export const useGameEngine = () => {
                                 agent.x = next.x;
                                 agent.y = next.y;
                                 agent.path.shift();
-                                agent.needs.energy = Math.max(0, agent.needs.energy - 1);
+                                agent.needs.energy = Math.max(0, agent.needs.energy - BALANCE.EVENT_MOVEMENT_COST);
                             } else {
                                 agent.path = [];
                             }
@@ -363,12 +462,10 @@ export const useGameEngine = () => {
                 if (zoneDef) {
                     const tx = Math.floor(zoneDef.x + zoneDef.w/2);
                     const ty = Math.floor(zoneDef.y + zoneDef.h/2);
-                    // Re-path if no path or periodic update
-                    if (!agent.path.length || tick % 5 === 0) {
-                        agent.path = findPath(map, agent.x, agent.y, tx, ty);
-                    }
+                    // Smart path recalculation - only recalc if target changed
+                    smartPathRecalc(agent, tx, ty, map);
                 }
-                
+
                 // Execute movement
                 if (agent.path.length > 0) {
                     if ((tick + agent.tickOffset) % agent.speed === 0) {
@@ -377,7 +474,7 @@ export const useGameEngine = () => {
                             agent.x = next.x;
                             agent.y = next.y;
                             agent.path.shift();
-                            agent.needs.energy = Math.max(0, agent.needs.energy - 2); 
+                            agent.needs.energy = Math.max(0, agent.needs.energy - BALANCE.HEAVY_MOVEMENT_COST);
                         } else {
                             agent.path = [];
                         }
@@ -507,7 +604,7 @@ export const useGameEngine = () => {
                         hs.phase = 'performing'; // Activity logic will pick this up to start 'holo_haiku'
                     } else {
                         hs.ticksWaiting++;
-                        if (hs.ticksWaiting > 50) {
+                        if (hs.ticksWaiting > BALANCE.HOLO_WAIT_TIMEOUT) {
                             // Timeout, move to next
                             hs.venueIndex = (hs.venueIndex + 1) % HOLO_CIRCUIT.length;
                             hs.venue = HOLO_CIRCUIT[hs.venueIndex];
@@ -716,11 +813,6 @@ export const useGameEngine = () => {
 
             // --- Movement for Circuit ---
             if (cs.phase === 'traveling' && cs.targetSpace) {
-                // Failsafe: Log status occasionally
-                if (tick % 50 === 0) {
-                    console.log(`Chef Circuit: Phase=${cs.phase}, Target=${cs.targetSpace}, Inv=${cs.inventory}, Pos=${agent.x},${agent.y}, LastMove=${cs.lastMoveTick}`);
-                }
-
                 // Override standard movement logic
                  if (agent.currentSpace === cs.targetSpace) {
                      // Arrived (handled in phase switch above, but redundant check safe)
@@ -728,11 +820,10 @@ export const useGameEngine = () => {
                      const targetCoords = getZoneCenter(cs.targetSpace, map);
                      if (targetCoords) {
                          // Robust Pathing Logic
-                         if (!agent.path.length || tick % 10 === 0 || (tick - cs.lastMoveTick > 20)) {
+                         if (!agent.path.length || tick % BALANCE.PATH_RECALC_INTERVAL_SLOW === 0 || (tick - cs.lastMoveTick > BALANCE.CHEF_STALL_RECALC_THRESHOLD)) {
                              // Recalculate if path empty OR periodic update OR stalled
                              agent.path = findPath(map, agent.x, agent.y, targetCoords.x, targetCoords.y);
-                             if (tick - cs.lastMoveTick > 20) {
-                                 console.warn('Chef Circuit: Recalculating path due to stall.');
+                             if (tick - cs.lastMoveTick > BALANCE.CHEF_STALL_RECALC_THRESHOLD) {
                                  cs.lastMoveTick = tick; // Reset stall timer after recalc attempt
                              }
                          }
@@ -750,8 +841,8 @@ export const useGameEngine = () => {
                                  agent.path = []; // Hit wall, clear path
                              }
                          } else {
-                             // HARD FAILSAFE: Teleport if stuck for > 60 ticks
-                             if (tick - cs.lastMoveTick > 60) {
+                             // HARD FAILSAFE: Teleport if stuck for too long
+                             if (tick - cs.lastMoveTick > BALANCE.CHEF_STALL_TELEPORT_THRESHOLD) {
                                  log('DEBUG', 'Chef SAGE', 'Circuit stalled. Emergency transport engaged.');
                                  agent.x = targetCoords.x;
                                  agent.y = targetCoords.y;
@@ -798,7 +889,7 @@ export const useGameEngine = () => {
                         agent.x = next.x;
                         agent.y = next.y;
                         agent.path.shift();
-                        agent.needs.energy = Math.max(0, agent.needs.energy - 5);
+                        agent.needs.energy = Math.max(0, agent.needs.energy - BALANCE.MOVEMENT_ENERGY_COST);
                     } else {
                         agent.path = [];
                     }
@@ -836,19 +927,11 @@ export const useGameEngine = () => {
                 // 2. Fallback: Least recently visited space
                 if (!targetSpaceId) {
                     let oldestVisit = Infinity;
-                    
-                    // Check all configured zones
+
+                    // Check all configured zones using the centralized mapping
                     ZONE_CONFIG.forEach(z => {
-                        const id = (() => {
-                            if (z.type === ZoneType.SHOP) return 'lucys-store';
-                            if (z.type === ZoneType.CAFE) return 'lalamoons-cafe';
-                            if (z.type === ZoneType.WORK) return 'the-workshop';
-                            if (z.type === ZoneType.QUIET) return 'the-quiet-room';
-                            if (z.type === ZoneType.GARDEN) return 'lalamoons-garden';
-                            return 'corridor';
-                        })();
-                        
-                        if (id === 'corridor') return;
+                        const id = ZONE_TO_SPACE_MAP[z.type];
+                        if (!id) return;
                         if (id === agent.currentSpace) return; // Don't pick current
 
                         const lastVisitTime = agent.lastVisited[id] || 0;
@@ -861,20 +944,10 @@ export const useGameEngine = () => {
                 }
 
                 if (targetSpaceId) {
-                    // Map back to zone
-                    const zoneDef = ZONE_CONFIG.find(z => {
-                         if (targetSpaceId === 'lucys-store') return z.type === ZoneType.SHOP;
-                         if (targetSpaceId === 'lalamoons-cafe') return z.type === ZoneType.CAFE;
-                         if (targetSpaceId === 'the-workshop') return z.type === ZoneType.WORK;
-                         if (targetSpaceId === 'the-quiet-room') return z.type === ZoneType.QUIET;
-                         if (targetSpaceId === 'lalamoons-garden') return z.type === ZoneType.GARDEN;
-                         return false;
-                    });
-                    
-                    if (zoneDef) {
-                         const tx = Math.floor(zoneDef.x + zoneDef.w/2);
-                         const ty = Math.floor(zoneDef.y + zoneDef.h/2);
-                         agent.path = findPath(map, agent.x, agent.y, tx, ty);
+                    // Map back to zone using centralized mapping
+                    const targetCoords = getZoneCenter(targetSpaceId, map);
+                    if (targetCoords) {
+                         agent.path = findPath(map, agent.x, agent.y, targetCoords.x, targetCoords.y);
                     }
                 }
             } else {
@@ -885,8 +958,8 @@ export const useGameEngine = () => {
                     agent.x = next.x;
                     agent.y = next.y;
                     agent.path.shift();
-                    agent.needs.energy = Math.max(0, agent.needs.energy - 3); // Light cost
-                    
+                    agent.needs.energy = Math.max(0, agent.needs.energy - BALANCE.LIGHT_MOVEMENT_COST);
+
                     // If arrived at end of path, remove explore motivation
                     if (agent.path.length === 0) {
                         agent.motivations = agent.motivations.filter(m => m.type !== 'explore');
@@ -940,9 +1013,7 @@ export const useGameEngine = () => {
                         return;
                     } else {
                         agent.currentAction = `To ${bestRecipient.name}`;
-                        if (!agent.path.length || tick % 5 === 0) {
-                            agent.path = findPath(map, agent.x, agent.y, bestRecipient.x, bestRecipient.y);
-                        }
+                        smartPathRecalc(agent, bestRecipient.x, bestRecipient.y, map);
                     }
                 }
             } 
@@ -990,26 +1061,12 @@ export const useGameEngine = () => {
                      return;
                  } else {
                      agent.currentAction = `Guiding ${inefficientTarget.name}`;
-                     if (!agent.path.length || tick % 5 === 0) {
-                        agent.path = findPath(map, agent.x, agent.y, inefficientTarget.x, inefficientTarget.y);
-                     }
+                     smartPathRecalc(agent, inefficientTarget.x, inefficientTarget.y, map);
                  }
             }
-            if (inefficientTarget && agent.path.length > 0) {} // Fallthrough
-            else if (inefficientTarget) return;
+            if (inefficientTarget) return;
         } // End Core AI
 
-        // --- HOLOGRAM SAGE'S STORYTELLER AI ---
-        // (NOTE: This block is now partially redundant due to the new circuit logic above, 
-        // but we keep it for fallback behavior if circuit state is somehow missing or standard narrative pickup outside circuit)
-        if (agent.type === AgentType.SAGE_HOLO && !agent.holoState) {
-            // Priority 0: Activity
-            if (isPerforming) {
-                agent.currentAction = "Performing";
-                return;
-            }
-            // Fallback old logic... (omitted for brevity, handled by new circuit logic)
-        } 
 
         // --- LALAMOON'S MATCHMAKER AI ---
         if (agent.type === AgentType.LALA) {
@@ -1039,9 +1096,7 @@ export const useGameEngine = () => {
                      return;
                 } else {
                      agent.currentAction = `Fetching ${candidate.name}`;
-                     if (!agent.path.length || tick % 5 === 0) {
-                         agent.path = findPath(map, agent.x, agent.y, candidate.x, candidate.y);
-                     }
+                     smartPathRecalc(agent, candidate.x, candidate.y, map);
                 }
             }
             // Fallthrough to standard logic if no candidates
@@ -1072,7 +1127,7 @@ export const useGameEngine = () => {
                     agent.path.shift();
                     
                     // 4. Movement Cost
-                    agent.needs.energy = Math.max(0, agent.needs.energy - 5); // -5% per move
+                    agent.needs.energy = Math.max(0, agent.needs.energy - BALANCE.MOVEMENT_ENERGY_COST);
                 } else {
                     agent.path = []; 
                 }
@@ -1220,7 +1275,6 @@ export const useGameEngine = () => {
 
     const processArtifactSystem = (state: GameState, tick: number) => {
         const { agents, map, artifacts, creationTasks } = state;
-        const creationCooldown = 30; // Min ticks between creations per agent
 
         // 1. CREATION CHECK LOGIC
         const tryCreate = (
@@ -1233,7 +1287,7 @@ export const useGameEngine = () => {
             narrative?: string
         ) => {
             // Check cooldowns
-            if (creators.some(c => (tick - c.lastCreationTick) < creationCooldown)) return;
+            if (creators.some(c => (tick - c.lastCreationTick) < BALANCE.CREATION_COOLDOWN)) return;
 
             let task = creationTasks[key];
             if (!task) {
@@ -1366,7 +1420,7 @@ export const useGameEngine = () => {
         // 2. CONSUMPTION LOGIC
         agents.forEach(agent => {
             if (agent.type === AgentType.LUCY) return; // Lucy observes
-            if (Math.random() > 0.5) return; // 50% chance to skip (was 70%) -> 50% consumption rate
+            if (Math.random() > BALANCE.CONSUMPTION_CHANCE) return; // Consumption rate
 
             // Find accessible artifacts
             const accessible = artifacts.filter(a => {
@@ -1391,10 +1445,10 @@ export const useGameEngine = () => {
                     // Culinary Curiosity Logic
                     if (isNewExperience) {
                          agent.foodLocationsVisited.push(agent.currentSpace);
-                         energyGain += 5; // +5% Energy
-                         agent.needs.connection = Math.min(100, agent.needs.connection + 8); // +8% Social
-                         agent.needs.purpose = Math.min(100, agent.needs.purpose + 3); // +3% Purpose
-                         agent.needs.stability = Math.min(100, agent.needs.stability + 5); // +5% Stability
+                         energyGain += BALANCE.NEW_CUISINE_ENERGY_BONUS;
+                         agent.needs.connection = Math.min(100, agent.needs.connection + BALANCE.NEW_CUISINE_CONNECTION_BONUS);
+                         agent.needs.purpose = Math.min(100, agent.needs.purpose + BALANCE.NEW_CUISINE_PURPOSE_BONUS);
+                         agent.needs.stability = Math.min(100, agent.needs.stability + BALANCE.NEW_CUISINE_STABILITY_BONUS);
                          log('DISCOVERY', `${CHARACTER_EMOJIS[agent.type]} ${agent.name}`, `Tasted circuit at ${agent.currentSpace} (+Bonus)`);
                          
                          // Reset check
@@ -1569,58 +1623,90 @@ export const useGameEngine = () => {
         s.ticks++;
         const currentTick = s.ticks;
 
-        // --- RHYTHMIC HOME INJECTION ---
-        // Every 400 ticks, for 20 ticks, inject 'return_home'
-        const isHomeTime = (currentTick % HOME_CYCLE_INTERVAL) < HOME_CYCLE_DURATION;
-        if (isHomeTime) {
-            s.agents.forEach(a => {
-                if (!a.motivations.some(m => m.type === 'return_home')) {
-                    a.motivations.push({
-                        type: 'return_home',
-                        intensity: 0.8,
-                        description: 'Returning to personal space',
-                        expiresAt: currentTick + HOME_CYCLE_DURATION + 20 // Buffer
-                    });
-                    // Optional: Log once per cycle per agent
-                    // log('RHYTHM', a.name, 'Returning home...');
+        // =================================================================
+        // TICK WRAPPER WITH ERROR RECOVERY
+        // WHY: One agent's error shouldn't crash the entire simulation.
+        // We log errors but continue processing other agents.
+        // =================================================================
+
+        try {
+            // --- RHYTHMIC HOME INJECTION ---
+            // Every 400 ticks, for 20 ticks, inject 'return_home'
+            const isHomeTime = (currentTick % HOME_CYCLE_INTERVAL) < HOME_CYCLE_DURATION;
+            if (isHomeTime) {
+                s.agents.forEach(a => {
+                    if (!a.motivations.some(m => m.type === 'return_home')) {
+                        a.motivations.push({
+                            type: 'return_home',
+                            intensity: 0.8,
+                            description: 'Returning to personal space',
+                            expiresAt: currentTick + HOME_CYCLE_DURATION + 20 // Buffer
+                        });
+                    }
+                });
+            }
+
+            // L-System Timer
+            s.l_timer++;
+            let glitch = false;
+            if (s.l_timer >= L_THRESHOLD) {
+                s.l_timer = 0;
+                initMap();
+                glitch = true;
+                // Reset stuck detection when map changes
+                // WHY: Map regeneration invalidates position history
+                resetStuckDetection();
+                const quote = QUOTES['L'][Math.floor(Math.random() * QUOTES['L'].length)];
+                log('L', 'SYSTEM', quote);
+            }
+
+            // =================================================================
+            // UPDATE AGENTS (with individual error isolation)
+            // WHY: If one agent's AI throws, others continue working
+            // =================================================================
+            s.agents.forEach(agent => {
+                try {
+                    updateAgent(agent, s, currentTick);
+                } catch (agentError) {
+                    // Log but don't crash - this agent will skip this tick
+                    console.error(`Error updating agent ${agent.name}:`, agentError);
+                    // Reset agent to safe state
+                    agent.path = [];
+                    agent.target = null;
+                    agent.currentAction = "Recovering...";
                 }
+
+                // =================================================================
+                // FINAL SAFETY NET: Clamp all needs after all operations
+                // WHY: Even if some code forgot to clamp, we ensure valid state
+                // This is called AFTER updateAgent to catch any edge cases
+                // =================================================================
+                clampAgentNeeds(agent);
             });
+
+            // Activity System (Progress & Decisions)
+            // This handles completion effects (like organization) and starts new activities
+            processActivitySystemLogic(s, currentTick);
+
+            // Process Event System (Gathering, Performance)
+            processEventSystem(s, currentTick);
+
+            // Artifact System (Creation & Consumption)
+            // This handles Chef meals, comics, sketches, and eating/reading
+            processArtifactSystem(s, currentTick);
+        } catch (tickError) {
+            // Catastrophic tick error - log but try to continue
+            console.error(`Tick ${currentTick} failed:`, tickError);
+            // The simulation will continue on the next tick
         }
-
-        // L-System Timer
-        s.l_timer++;
-        let glitch = false;
-        if (s.l_timer >= L_THRESHOLD) {
-            s.l_timer = 0;
-            initMap();
-            glitch = true;
-            const quote = QUOTES['L'][Math.floor(Math.random() * QUOTES['L'].length)];
-            log('L', 'SYSTEM', quote);
-        }
-
-        // Update Agents (Movement, Needs, AI)
-        s.agents.forEach(agent => {
-            updateAgent(agent, s, currentTick);
-        });
-
-        // Activity System (Progress & Decisions)
-        // This handles completion effects (like organization) and starts new activities
-        processActivitySystemLogic(s, currentTick);
-
-        // Process Event System (Gathering, Performance)
-        processEventSystem(s, currentTick);
-
-        // Artifact System (Creation & Consumption)
-        // This handles Chef meals, comics, sketches, and eating/reading
-        processArtifactSystem(s, currentTick);
 
         // TETHER PASSIVE CARE EFFECT
         const carl = s.agents.find(a => a.type === AgentType.CARL);
         const fox = s.agents.find(a => a.type === AgentType.FOX);
-        
+
         if (carl && fox) {
              const dist = Math.abs(carl.x - fox.x) + Math.abs(carl.y - fox.y);
-             if (dist <= 2) { // Close proximity
+             if (dist <= BALANCE.TETHER_PROXIMITY) {
                  const map = s.map;
                  const carlTile = getTile(map, carl.x, carl.y);
                  const foxTile = getTile(map, fox.x, fox.y);
@@ -1629,15 +1715,15 @@ export const useGameEngine = () => {
 
                  // Case 1: Carl resting, Fox tending
                  if (carlResting && !foxResting) {
-                      carl.needs.energy = Math.min(100, carl.needs.energy + 5);
-                      fox.needs.energy = Math.min(100, fox.needs.energy + 3);
-                      if (s.ticks % 20 === 0) log('CARE', 'Fox', 'Tending to resting Carl (+Energy)');
+                      carl.needs.energy = Math.min(100, carl.needs.energy + BALANCE.TETHER_CARE_BOOST);
+                      fox.needs.energy = Math.min(100, fox.needs.energy + BALANCE.TETHER_CARE_GIVER_BOOST);
+                      if (s.ticks % BALANCE.HISTORY_LENGTH === 0) log('CARE', 'Fox', 'Tending to resting Carl (+Energy)');
                  }
                  // Case 2: Fox resting, Carl tending
                  else if (foxResting && !carlResting) {
-                      fox.needs.energy = Math.min(100, fox.needs.energy + 5);
-                      carl.needs.energy = Math.min(100, carl.needs.energy + 3);
-                      if (s.ticks % 20 === 0) log('CARE', 'Carl', 'Tending to resting Fox (+Energy)');
+                      fox.needs.energy = Math.min(100, fox.needs.energy + BALANCE.TETHER_CARE_BOOST);
+                      carl.needs.energy = Math.min(100, carl.needs.energy + BALANCE.TETHER_CARE_GIVER_BOOST);
+                      if (s.ticks % BALANCE.HISTORY_LENGTH === 0) log('CARE', 'Carl', 'Tending to resting Fox (+Energy)');
                  }
              }
         }
@@ -1650,10 +1736,10 @@ export const useGameEngine = () => {
         // Colocation
         for(let i=0; i<s.agents.length; i++) {
             for(let j=i+1; j<s.agents.length; j++) {
-                const a1 = s.agents[i]; 
+                const a1 = s.agents[i];
                 const a2 = s.agents[j];
                 const dist = Math.abs(a1.x - a2.x) + Math.abs(a1.y - a2.y);
-                if(dist < 3) {
+                if(dist < BALANCE.COLOCATION_DISTANCE) {
                     const key = [a1.name, a2.name].sort().join("::");
                     s.stats.colocation[key] = (s.stats.colocation[key] || 0) + 1;
                 }

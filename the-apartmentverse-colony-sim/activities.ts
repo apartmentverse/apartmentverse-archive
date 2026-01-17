@@ -1,6 +1,7 @@
 
 import { Character, CharacterId, SpaceId, Agent } from './types';
 import { Activity, ActivityProgress, ActivityCategory, ActivityDecision, ActivityDefinition } from './types';
+import { BALANCE } from './constants';
 
 export class ActivitySystem {
   activityProgress: Map<CharacterId, ActivityProgress> = new Map();
@@ -148,7 +149,7 @@ export class ActivitySystem {
                 intensity: 0.65,
                 description: 'Feeling energized, wants to move',
                 target: undefined,
-                expiresAt: tick + 15
+                expiresAt: tick + BALANCE.POST_ACTIVITY_MOTIVATION_DURATION
             });
         }
 
@@ -272,29 +273,30 @@ export class ActivityDefinitions {
                 audienceBenefits: []
              };
         }
-        if (charId === 'sage-hologram' && (category === 'social' || category === 'stability')) {
-            return {
-                id: 'holo_perform',
-                name: 'Holographic Play',
-                emoji: '🎭',
-                category: category,
-                duration: 30,
-                selfBenefit: 0.3,
-                preferredLocations: ['lalamoons-cafe', 'lucys-store', 'the-workshop', 'holograms-backstage'],
-                audienceBenefits: [{ characterId: 'fennec', energyGain: 0.1 }, { characterId: 'lalamoon', energyGain: 0.1 }]
-            };
-        }
-        // NEW: Short Circuit Haiku Performance
+        // Hologram social: Quick haiku performance (circuit behavior)
         if (charId === 'sage-hologram' && category === 'social') {
             return {
                 id: 'holo_haiku',
                 name: 'Reciting Haiku',
                 emoji: '📜',
                 category: 'social',
-                duration: 2, // Very fast
+                duration: 2, // Very fast for circuit flow
                 selfBenefit: 0.05,
                 preferredLocations: ['lucys-store', 'lalamoons-cafe', 'the-workshop'],
                 audienceBenefits: [{ characterId: 'lalamoon', energyGain: 0.05 }, { characterId: 'lucy', energyGain: 0.05 }, { characterId: 'carl-toughie', energyGain: 0.05 }]
+            };
+        }
+        // Hologram stability: Longer holographic play performance
+        if (charId === 'sage-hologram' && category === 'stability') {
+            return {
+                id: 'holo_perform',
+                name: 'Holographic Play',
+                emoji: '🎭',
+                category: 'stability',
+                duration: 30,
+                selfBenefit: 0.3,
+                preferredLocations: ['lalamoons-cafe', 'lucys-store', 'the-workshop', 'holograms-backstage'],
+                audienceBenefits: [{ characterId: 'fennec', energyGain: 0.1 }, { characterId: 'lalamoon', energyGain: 0.1 }]
             };
         }
 

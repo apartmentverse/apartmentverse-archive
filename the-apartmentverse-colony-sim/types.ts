@@ -32,6 +32,34 @@ export type ArtifactType = 'comic' | 'meal' | 'comfort_item' | 'desperate_sketch
 export type CharacterId = string;
 export type SpaceId = string;
 
+// Motivation types - all possible motivation drivers
+export type MotivationType =
+    | 'seek_connection'
+    | 'care_for_others'
+    | 'create'
+    | 'distribute_burden'
+    | 'solve_problem'
+    | 'perform'
+    | 'optimize'
+    | 'learn'
+    | 'rest'
+    | 'attend_event'
+    | 'return_home'
+    | 'collaborate'
+    | 'explore'
+    | 'post_activity_movement';
+
+// Relationship types - all possible relationship connections
+export type RelationshipType =
+    | 'tether'           // Primary bond (Carl-Fox)
+    | 'care'             // Emotional support
+    | 'mentor'           // Teaching relationship
+    | 'student'          // Learning relationship
+    | 'care_worker'      // Professional care role
+    | 'audience'         // Performer-audience
+    | 'collaboration'    // Working partnership
+    | 'mirror';          // Character mirror/variant
+
 export interface Point {
     x: number;
     y: number;
@@ -45,7 +73,7 @@ export interface AgentNeeds {
 }
 
 export interface Motivation {
-    type: string;
+    type: MotivationType;
     intensity: number;
     target?: string;
     description?: string;
@@ -54,8 +82,8 @@ export interface Motivation {
 }
 
 export interface Relationship {
-    targetId: string;
-    type: string;
+    targetId: CharacterId;
+    type: RelationshipType;
     strength: number;
 }
 
@@ -107,7 +135,10 @@ export interface Agent {
     // Location Preference Tracking
     lastActivityLocation?: SpaceId;
     lastActivityTick?: number;
-    
+
+    // Path optimization - track last target to avoid redundant recalculations
+    lastPathTarget?: string;
+
     // Custom State
     chefState?: ChefCircuitState;
     holoState?: HoloCircuitState;

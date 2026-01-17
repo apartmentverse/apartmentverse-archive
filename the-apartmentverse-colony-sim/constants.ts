@@ -10,6 +10,64 @@ export const RESTLESS_CYCLE_TICKS = 250; // Average ticks between exploration wa
 export const HOME_CYCLE_INTERVAL = 400; // Rhythm cycle length
 export const HOME_CYCLE_DURATION = 20; // How long the return home urge lasts (initiation window)
 
+// Simulation Balance Constants - centralized for easy tuning
+export const BALANCE = {
+    // Energy & Needs
+    REST_RESTORATION_RATE: 50,          // Energy gained per tick in rest zone
+    BASE_ENERGY_DECAY: 0.2,             // Base energy decay per tick
+    STABILITY_DECAY: 0.1,               // Stability decay per tick
+    PASSIVE_ENERGY_REGEN: 2,            // Passive energy regen when idle
+
+    // Movement Costs
+    MOVEMENT_ENERGY_COST: 5,            // Standard movement cost
+    LIGHT_MOVEMENT_COST: 3,             // Exploration movement cost
+    HEAVY_MOVEMENT_COST: 2,             // Home return movement cost
+    EVENT_MOVEMENT_COST: 1,             // Event attendance movement cost
+
+    // Zone Benefits (per tick)
+    SHOP_STABILITY_BONUS: 2,
+    CAFE_CONNECTION_BONUS: 1.5,
+    WORK_PURPOSE_BONUS: 1.5,
+
+    // Thresholds
+    LOW_ENERGY_THRESHOLD: 30,           // When agent needs rest
+    RECOVERED_ENERGY_THRESHOLD: 90,     // When agent is fully rested
+    CRITICAL_ENERGY_THRESHOLD: 5,       // Emergency energy level
+
+    // Timeouts & Cooldowns
+    CREATION_COOLDOWN: 30,              // Min ticks between creations per agent
+    HOLO_WAIT_TIMEOUT: 50,              // Ticks before Holo moves to next venue
+    CHEF_STALL_RECALC_THRESHOLD: 20,    // Ticks before Chef recalculates path
+    CHEF_STALL_TELEPORT_THRESHOLD: 60,  // Ticks before Chef teleports (failsafe)
+    PATH_RECALC_INTERVAL: 5,            // Default path recalculation interval
+    PATH_RECALC_INTERVAL_SLOW: 10,      // Slower path recalculation interval
+
+    // Pathfinding
+    MAX_PATH_ITERATIONS: 1000,          // A* max iterations
+
+    // Analytics
+    COLOCATION_DISTANCE: 3,             // Manhattan distance for colocation
+    HISTORY_LENGTH: 20,                 // Sparkline history length
+    LOG_MAX_ENTRIES: 50,                // Max log entries to keep
+
+    // Tether Care
+    TETHER_PROXIMITY: 2,                // Distance for tether care effect
+    TETHER_CARE_BOOST: 5,               // Energy boost for cared-for agent
+    TETHER_CARE_GIVER_BOOST: 3,         // Energy boost for caregiver
+
+    // Activity System
+    MIN_ENERGY_FOR_ACTIVITY_SAGE: 10,
+    MIN_ENERGY_FOR_ACTIVITY_OTHER: 15,
+    POST_ACTIVITY_MOTIVATION_DURATION: 15,
+
+    // Consumption
+    CONSUMPTION_CHANCE: 0.5,            // 50% chance to consume per tick
+    NEW_CUISINE_ENERGY_BONUS: 5,
+    NEW_CUISINE_CONNECTION_BONUS: 8,
+    NEW_CUISINE_PURPOSE_BONUS: 3,
+    NEW_CUISINE_STABILITY_BONUS: 5,
+} as const;
+
 export const COLORS = {
     [ZoneType.WALL]: '#1e293b',
     [ZoneType.FLOOR]: '#0f172a',
@@ -77,6 +135,27 @@ export const AGENT_REST_ZONES: Record<AgentType, ZoneType> = {
     [AgentType.SAGE_CORE]: ZoneType.TERMINAL,
     [AgentType.SAGE_HOLO]: ZoneType.BACKSTAGE
 };
+
+// Centralized ZoneType to SpaceId mapping - eliminates duplicate switch statements
+export const ZONE_TO_SPACE_MAP: Partial<Record<ZoneType, string>> = {
+    [ZoneType.SHOP]: 'lucys-store',
+    [ZoneType.CAFE]: 'lalamoons-cafe',
+    [ZoneType.WORK]: 'the-workshop',
+    [ZoneType.QUIET]: 'the-quiet-room',
+    [ZoneType.BALCONY]: 'carls-balcony',
+    [ZoneType.DEN]: 'fox-den',
+    [ZoneType.BASEMENT]: 'lucys-basement',
+    [ZoneType.GARDEN]: 'lalamoons-garden',
+    [ZoneType.PICNIC]: 'chefs-picnic-table',
+    [ZoneType.SOFT_LAB]: 'fennecs-soft-lab',
+    [ZoneType.TERMINAL]: 'cores-terminal',
+    [ZoneType.BACKSTAGE]: 'holograms-backstage',
+};
+
+// Reverse mapping: SpaceId to ZoneType
+export const SPACE_TO_ZONE_MAP: Record<string, ZoneType> = Object.fromEntries(
+    Object.entries(ZONE_TO_SPACE_MAP).map(([zone, space]) => [space, Number(zone) as ZoneType])
+);
 
 // Locations Chef SAGE monitors for food distribution
 export const CHEF_TARGET_SPACES = [
