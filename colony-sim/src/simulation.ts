@@ -1,12 +1,25 @@
 /**
  * Main simulation engine - character-driven colony sim
  * Runs tick by tick, with characters making decisions based on their motivations
+ * Now includes analytics tracking and visualization export
  */
 
 import { SimulationState, SimulationEvent, Character, Space } from './types.js';
 import { createAllCharacters } from './characters.js';
 import { createAllSpaces, getHubSpaceId } from './spaces.js';
 import { MovementSystem } from './movement.js';
+import { SimulationAnalytics } from './analytics.js';
+import { 
+  generateComprehensiveReport,
+  generateSpaceHeatMap,
+  generateProximityMatrix,
+  generateEnergyCurvesSummary 
+} from './visualizations.js';
+import { 
+  exportToJSON,
+  exportAllCSV,
+  exportToHTML 
+} from './exporters.js';
 
 /**
  * Simulation configuration
@@ -15,6 +28,9 @@ export interface SimulationConfig {
   maxTicks?: number;
   tickDelay?: number; // ms between ticks (for visualization)
   verbose?: boolean; // Log all events
+  enableAnalytics?: boolean; // Track analytics data
+  exportAnalytics?: boolean; // Export analytics after simulation
+  outputDir?: string; // Directory for analytics exports
 }
 
 /**
@@ -23,14 +39,19 @@ export interface SimulationConfig {
 export class ColonySimulation {
   private state: SimulationState;
   private movementSystem: MovementSystem;
+  private analytics: SimulationAnalytics;
   private config: SimulationConfig;
   private running: boolean = false;
+  private eventsThisTick: SimulationEvent[] = [];
 
   constructor(config: SimulationConfig = {}) {
     this.config = {
       maxTicks: config.maxTicks || 100,
       tickDelay: config.tickDelay || 0,
-      verbose: config.verbose !== undefined ? config.verbose : true
+      verbose: config.verbose !== undefined ? config.verbose : true,
+      enableAnalytics: config.enableAnalytics !== undefined ? config.enableAnalytics : true,
+      exportAnalytics: config.exportAnalytics !== undefined ? config.exportAnalytics : true,
+      outputDir: config.outputDir || './analytics-output'
     };
 
     const hubSpaceId = getHubSpaceId();
@@ -44,9 +65,14 @@ export class ColonySimulation {
     };
 
     this.movementSystem = new MovementSystem();
+    this.analytics = new SimulationAnalytics();
 
-    // Initialize space occupants
+    // Initialize space occupants and analytics
     this.initializeSpaceOccupants();
+    
+    if (this.config.enableAnalytics) {
+      this.analytics.initialize(this.state.characters, this.state.spaces);
+    }
   }
 
   /**
@@ -66,6 +92,7 @@ export class ColonySimulation {
    */
   tick(): void {
     this.state.tick++;
+    this.eventsThisTick = [];
 
     // Each character makes a decision based on their motivations
     for (const [charId, character] of this.state.characters) {
@@ -90,6 +117,7 @@ export class ColonySimulation {
         );
 
         this.state.events.push(result.event);
+        this.eventsThisTick.push(result.event);
 
         if (this.config.verbose) {
           this.logEvent(result.event);
@@ -102,6 +130,16 @@ export class ColonySimulation {
 
     // Update character states (energy, needs, etc.)
     this.updateCharacterStates();
+
+    // Record analytics for this tick
+    if (this.config.enableAnalytics) {
+      this.analytics.recordTick(
+        this.state.tick,
+        this.state.characters,
+        this.state.spaces,
+        this.eventsThisTick
+      );
+    }
   }
 
   /**
@@ -151,6 +189,7 @@ export class ColonySimulation {
       };
 
       this.state.events.push(event);
+      this.eventsThisTick.push(event);
 
       if (this.config.verbose) {
         this.logEvent(event);
@@ -293,7 +332,11 @@ export class ColonySimulation {
     console.log(`Starting simulation for ${maxTicks} ticks\n`);
     console.log(`Hub: Lucy's Sundries Store`);
     console.log(`Characters: ${this.state.characters.size}`);
-    console.log(`Spaces: ${this.state.spaces.size}\n`);
+    console.log(`Spaces: ${this.state.spaces.size}`);
+    if (this.config.enableAnalytics) {
+      console.log(`Analytics: ENABLED (will export to ${this.config.outputDir})`);
+    }
+    console.log('\n');
 
     for (let i = 0; i < maxTicks && this.running; i++) {
       this.tick();
@@ -304,6 +347,55 @@ export class ColonySimulation {
     }
 
     this.printSummary();
+
+    // Finalize and export analytics
+    if (this.config.enableAnalytics) {
+      this.finalizeAnalytics();
+    }
+  }
+
+  /**
+   * Finalize analytics and export visualizations
+   */
+  private finalizeAnalytics(): void {
+    console.log('\n' + '='.repeat(64));
+    console.log('GENERATING ANALYTICS...');
+    console.log('='.repeat(64) + '\n');
+
+    this.analytics.finalize();
+
+    // Generate text visualizations
+    console.log(generateSpaceHeatMap(this.analytics));
+    console.log(generateEnergyCurvesSummary(this.analytics));
+    console.log(generateProximityMatrix(this.analytics));
+
+    // Export analytics if enabled
+    if (this.config.exportAnalytics) {
+      try {
+        // Create output directory
+        const fs = require('fs');
+        if (!fs.existsSync(this.config.outputDir)) {
+          fs.mkdirSync(this.config.outputDir!, { recursive: true });
+        }
+
+        // Export in multiple formats
+        exportToJSON(this.analytics, `${this.config.outputDir}/analytics.json`);
+        exportAllCSV(this.analytics, this.config.outputDir!);
+        exportToHTML(this.analytics, `${this.config.outputDir}/analytics.html`);
+
+        // Generate comprehensive text report
+        const report = generateComprehensiveReport(this.analytics);
+        fs.writeFileSync(`${this.config.outputDir}/report.txt`, report, 'utf-8');
+        console.log(`✓ Comprehensive report saved: ${this.config.outputDir}/report.txt`);
+
+        console.log('\n' + '='.repeat(64));
+        console.log('✓ ANALYTICS EXPORT COMPLETE');
+        console.log('='.repeat(64));
+        console.log(`\nOpen ${this.config.outputDir}/analytics.html in your browser for interactive visualizations!\n`);
+      } catch (error) {
+        console.error('Error exporting analytics:', error);
+      }
+    }
   }
 
   /**
@@ -318,6 +410,13 @@ export class ColonySimulation {
    */
   getState(): SimulationState {
     return this.state;
+  }
+
+  /**
+   * Get analytics data
+   */
+  getAnalytics(): SimulationAnalytics {
+    return this.analytics;
   }
 
   /**
